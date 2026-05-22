@@ -1,0 +1,147 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║           DATA CONTRACT SCHEMATIC — PipelineContext Node-to-Node          ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+STAGE 0: pipeline_orchestrator.run_pipeline(task, max_review_cycles=3)
+─────────────────────────────────────────────────────────────────────
+  CREATES ──►  PipelineContext {
+                 "task":               "Implement a rate-limiter...",
+                 "status":             PipelineStatus.PENDING,
+                 "engineer_result":    None,
+                 "review_result":      None,
+                 "qa_result":          None,
+                 "review_cycles":      0,
+                 "max_review_cycles":  3,
+                 "started_at":         1716000000.0
+               }
+
+STAGE 1: EngineerAgent.implement(task)  →  EngineerAgent.run(prompt)
+─────────────────────────────────────────────────────────────────────
+  CALLS Anthropic API (AsyncAnthropic, with retry) ──►
+    model:       "claude-sonnet-4-5"
+    max_tokens:  4096
+    tools:       TOOL_SCHEMAS (read + write + exec)
+    messages:    [{ "role": "user", "content": "<task prompt>" }]
+
+  TOOL CALLS during loop:
+    patch_file(write: src/rate_limiter.py)       ← writes implementation
+    patch_file(write: tests/test_rate_limiter.py) ← writes tests
+    execute_terminal_command("pytest tests/ -v")  ← runs in Docker sandbox
+    → stdout/stderr sanitized before re-entry
+    → non-zero exit_code triggers debug directive injection
+
+  EMITS ──►  AgentResult {
+               "agent_role":     "engineer",
+               "success":        True,
+               "summary":        "Implementation complete. 12 tests passing.",
+               "details":        "<full model response>",
+               "input_tokens":   1240,
+               "output_tokens":  980,
+               "iterations":     6,
+               "duration_s":     94.2
+             }
+
+STAGE 2: ReviewerAgent.review()
+─────────────────────────────────────────────────────────────────────
+  TOOLS AVAILABLE: READ_ONLY_TOOL_SCHEMAS only
+    patch_file operations permitted: ["read", "list_dir"]  ← schema-enforced
+    patch_file write/append/patch/delete: BLOCKED at API + dispatch level
+
+  CALLS during loop:
+    patch_file(list_dir: src/)
+    patch_file(read: src/rate_limiter.py)
+    patch_file(read: tests/test_rate_limiter.py)
+    execute_terminal_command("flake8 src/ tests/ --max-line-length=100")
+    execute_terminal_command("bandit -r src/ -ll")
+    execute_terminal_command("mypy src/ --ignore-missing-imports")
+
+  MODEL OUTPUT (last block in response):
+```json
+  {
+    "decision": "APPROVED | NEEDS_WORK | REJECTED",
+    "summary":  "<one-sentence verdict>",
+    "findings": [
+      {
+        "severity":    "critical | major | minor | info",
+        "category":    "security | correctness | performance | style | test_coverage",
+        "file_path":   "src/rate_limiter.py",
+        "description": "<what is wrong>",
+        "suggestion":  "<how to fix>"
+      }
+    ]
+  }
+```
+
+  EMITS ──►  AgentResult {
+               "agent_role":  "reviewer",
+               "decision":    GateDecision.APPROVED | NEEDS_WORK | REJECTED,
+               "artifacts":   { "findings": [...] },
+               "input_tokens":  820,
+               "output_tokens": 540,
+               ...
+             }
+
+  GATE LOGIC in orchestrator:
+  ┌────────────────────────────────────────────────────────────────────┐
+  │ APPROVED   → advance to Stage 3                                    │
+  │ NEEDS_WORK → extract findings → engineer.revise() → re-review      │
+  │              (max_review_cycles=3; exhausted = REVIEW_FAILED)      │
+  │ REJECTED   → pipeline.status = REVIEW_FAILED → return immediately  │
+  └────────────────────────────────────────────────────────────────────┘
+
+STAGE 3: QAAgent.validate()
+─────────────────────────────────────────────────────────────────────
+  TOOLS: TOOL_SCHEMAS (exec + read only at runtime — no pip install)
+  All deps pre-baked in Docker image. Container has --network none.
+
+  CALLS during loop:
+    execute_terminal_command("pytest tests/ -v --tb=short --cov=src --cov-report=term-missing")
+    patch_file(write: qa_report.json)
+
+  MODEL OUTPUT:
+```json
+  {
+    "decision":                  "APPROVED | REJECTED",
+    "summary":                   "<one-sentence verdict>",
+    "test_results":              { "total": 12, "passed": 12, "failed": 0, ... },
+    "coverage_pct":              94.0,
+    "coverage_meets_threshold":  true,
+    "blocking_issues":           []
+  }
+```
+
+  EMITS ──►  AgentResult {
+               "agent_role":  "qa",
+               "decision":    GateDecision.APPROVED | REJECTED,
+               "artifacts":   { "qa_report": { ... } },
+               "input_tokens":  640,
+               "output_tokens": 380,
+               ...
+             }
+
+  GATE LOGIC:
+  ┌────────────────────────────────────────────────────────────────────┐
+  │ APPROVED → advance to Stage 4 _deploy()                            │
+  │ REJECTED → pipeline.status = QA_FAILED → return (no engineer loop) │
+  │            QA failures require human investigation, not AI retry    │
+  └────────────────────────────────────────────────────────────────────┘
+
+STAGE 4: _deploy(ctx)  →  PipelineStatus.DEPLOYED
+─────────────────────────────────────────────────────────────────────
+  RECEIVES ──►  PipelineContext (all three AgentResults populated)
+  CALLS   ──►   User-defined deployment logic (kubectl / fly / GH Actions)
+  RETURNS ──►   bool: True = DEPLOYED, False = ABORTED
+
+FINAL: PipelineContext.to_summary()
+─────────────────────────────────────────────────────────────────────
+  EMITS ──►
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Task      : Implement a rate-limiter...                          │
+  │ Status    : deployed                                             │
+  │ Elapsed   : 187.4s                                               │
+  │ Rev cycles: 1/3                                                  │
+  │ Tokens    : 2,700 in / 1,900 out  (~$0.0366)                    │
+  │   ✅ [engineer] Implementation complete  (1,240in/980out)        │
+  │   ✅ [reviewer] APPROVED — 0 findings    (820in/540out)          │
+  │   ✅ [qa]       12/12 passed, 94% cov    (640in/380out)          │
+  └──────────────────────────────────────────────────────────────────┘
