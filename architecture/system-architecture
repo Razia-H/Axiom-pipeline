@@ -1,0 +1,83 @@
+╔══════════════════════════════════════════════════════════════════════════════════════════╗
+║              AXIOM — ZERO-TRUST MULTI-AGENT AI ENGINEERING PIPELINE                     ║
+║                          End-to-End System Architecture                                  ║
+╚══════════════════════════════════════════════════════════════════════════════════════════╝
+
+  ┌──────────────────────────┐
+  │      INPUT LAYER         │
+  │  ──────────────────────  │
+  │  User Task (plain text)  │
+  │  e.g. "Implement a       │
+  │  rate-limiter in         │
+  │  src/rate_limiter.py     │
+  │  with full test coverage"│
+  └────────────┬─────────────┘
+               │  pipeline_orchestrator.py
+               ▼
+  ┌──────────────────────────┐
+  │    ORCHESTRATOR LAYER    │
+  │  ──────────────────────  │
+  │  pipeline_orchestrator   │
+  │  · Instantiates agents   │
+  │  · Controls stage gates  │
+  │  · Manages review cycles │
+  │  · Tracks cost / tokens  │
+  │  · Calls _deploy() hook  │
+  └────────────┬─────────────┘
+               │
+               ▼
+╔══════════════╧═════════════════════════════════════════════════════════╗
+║                        SEQUENTIAL GATE PIPELINE                        ║
+║             Each stage must PASS before the next stage runs            ║
+╠════════════════════╦═══════════════════════╦══════════════════════════╣
+║    STAGE 1         ║      STAGE 2          ║        STAGE 3           ║
+║                    ║                       ║                          ║
+║  ┌──────────────┐  ║  ┌───────────────┐   ║  ┌──────────────────┐   ║
+║  │   ENGINEER   │  ║  │   REVIEWER    │   ║  │      QA          │   ║
+║  │    AGENT     │  ║  │    AGENT      │   ║  │    AGENT         │   ║
+║  └──────┬───────┘  ║  └───────┬───────┘   ║  └────────┬─────────┘   ║
+║         │          ║          │            ║           │             ║
+║  Writes src/ +     ║  Reads files (ONLY)  ║  Runs pytest --cov      ║
+║  tests/            ║  Runs flake8,        ║  Validates coverage ≥   ║
+║  Runs pytest       ║  bandit, mypy        ║  threshold              ║
+║  Fixes failures    ║  Issues structured   ║  Writes qa_report.json  ║
+║  before returning  ║  JSON verdict        ║  Issues APPROVED or     ║
+║                    ║                      ║  REJECTED decision      ║
+║  OUTPUT            ║  OUTPUT              ║  OUTPUT                 ║
+║  AgentResult       ║  AgentResult +       ║  AgentResult +          ║
+║  success=True/     ║  GateDecision:       ║  GateDecision:          ║
+║  False             ║  APPROVED /          ║  APPROVED /             ║
+║                    ║  NEEDS_WORK /        ║  REJECTED               ║
+║                    ║  REJECTED            ║                         ║
+╚════════════════════╩═══════════════════════╩══════════════════════════╝
+               │              │                        │
+               │     ┌────────┘                        │
+               │     │  NEEDS_WORK: findings sent      │
+               │     │  back to Engineer (max 3 cycles)│
+               │     └──► engineer.revise() ──► re-review
+               │                                       │
+               └──────────────────────────────────────┘
+                               APPROVED
+                                  │
+                                  ▼
+                    ┌─────────────────────────┐
+                    │    STAGE 4 — DEPLOY      │
+                    │  ─────────────────────  │
+                    │  _deploy(ctx) hook       │
+                    │  Pluggable: kubectl /    │
+                    │  fly / GitHub Actions /  │
+                    │  AWS CodeDeploy          │
+                    │                          │
+                    │  Returns True = DEPLOYED │
+                    │  Returns False = ABORTED │
+                    └─────────────────────────┘
+
+╔══════════════════════════════════════════════════════════════════════════════════════════╗
+║                         SECURITY LAYER  (wraps every stage)                             ║
+║                                                                                          ║
+║   ALL COMMANDS: docker exec --user sandboxuser --workdir /workspace <container>          ║
+║   ALL OUTPUTS:  sanitize_output() — regex redaction of credentials before API re-entry  ║
+║   ALL FILES:    _safe_resolve() — Path.resolve() traversal guard, workspace-bounded      ║
+║   REVIEWER:     READ_ONLY_TOOL_SCHEMAS — write ops absent from API schema + dispatch     ║
+║   NETWORK:      --network none on container — zero outbound internet from sandbox        ║
+╚══════════════════════════════════════════════════════════════════════════════════════════╝
